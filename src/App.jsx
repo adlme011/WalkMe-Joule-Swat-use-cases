@@ -1,5 +1,22 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
+import { initializeApp } from "firebase/app";
+import { getDatabase, ref, onValue, set } from "firebase/database";
 
+// --- FIREBASE CONFIG ---
+const firebaseConfig = {
+  apiKey: "AIzaSyCuAnztaPK7cpICrUTyZTngqreZkcE8Wb8",
+  authDomain: "tiger-team-tracker.firebaseapp.com",
+  databaseURL: "https://tiger-team-tracker-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "tiger-team-tracker",
+  storageBucket: "tiger-team-tracker.firebasestorage.app",
+  messagingSenderId: "904012882504",
+  appId: "1:904012882504:web:aea7ead1c4f16781072e7d"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+
+// --- DATA TEMPLATES ---
 const DEPT_OPTIONS = ["IT", "Digital Transformation", "HR", "Finance", "Operations", "Procurement", "C-Suite", "Product", "Engineering", "Sales", "Customer Success", "Other"];
 const ROLE_OPTIONS = ["VP", "Director", "Manager", "Architect", "Admin", "Analyst", "Executive Sponsor", "End User Champion", "Other"];
 
@@ -89,53 +106,94 @@ const textareaStyle = { ...inputStyle, minHeight: 60, resize: "vertical", lineHe
 let contactIdCounter = 100;
 let actionIdCounter = 200;
 
-const STORAGE_KEY = "tiger-team-data";
-
-const loadSaved = () => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (data.contactIdCounter) contactIdCounter = data.contactIdCounter;
-    if (data.actionIdCounter) actionIdCounter = data.actionIdCounter;
-    return data;
-  } catch { return null; }
-};
-
 export default function TigerTeamProgram() {
-  const [accounts, setAccounts] = useState(() => {
-    const saved = loadSaved();
-    return saved?.accounts || makeAccounts();
-  });
-  const [customColumns, setCustomColumns] = useState(() => {
-    const saved = loadSaved();
-    return saved?.customColumns || [];
-  });
+  const [accounts, setAccounts] = useState(makeAccounts);
+  const [customColumns, setCustomColumns] = useState([]);
   const [activeTab, setActiveTab] = useState("overview");
   const [editingAccount, setEditingAccount] = useState(null);
   const [editName, setEditName] = useState("");
   const [showAddField, setShowAddField] = useState(false);
   const [newFieldName, setNewFieldName] = useState("");
   const [newFieldType, setNewFieldType] = useState("text");
-  const [lastSaved, setLastSaved] = useState(null);
+  const [syncStatus, setSyncStatus] = useState("connecting");
+  const [loading, setLoading] = useState(true);
 
-  // Auto-save to localStorage on every data change
+  const isLocalUpdate = useRef(false);
+  const saveTimer = useRef(null);
+
+  // --- FIREBASE: Listen for real-time changes ---
   useEffect(() => {
-    const data = {
-      accounts,
-      customColumns,
-      contactIdCounter,
-      actionIdCounter,
-      savedAt: new Date().toISOString(),
-    };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    setLastSaved(new Date());
-  }, [accounts, customColumns]);
+    const dataRef = ref(db, "trackerData");
+    const unsubscribe = onValue(dataRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data && !isLocalUpdate.current) {
+        if (data.accounts) {
+          const loaded = data.accounts.map(a => ({ ...a, expanded: false, contacts: a.contacts || [], customFields: a.customFields || {} }));
+          setAccounts(loaded);
+        }
+        if (data.customColumns) setCustomColumns(data.customColumns);
+        if (data.contactIdCounter) contactIdCounter = data.contactIdCounter;
+        if (data.actionIdCounter) actionIdCounter = data.actionIdCounter;
+        setSyncStatus("synced");
+      }
+      isLocalUpdate.current = false;
+      setLoading(false);
+    }, (error) => {
+      console.error("Firebase read error:", error);
+      setSyncStatus("error");
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
 
-  const updateAccount = (id, updater) => setAccounts(prev => prev.map(a => a.id === id ? updater(a) : a));
+  // --- FIREBASE: Save data (debounced) ---
+  const saveToFirebase = (newAccounts, newCustomColumns) => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      isLocalUpdate.current = true;
+      setSyncStatus("saving");
+      const cleanAccounts = (newAccounts || accounts).map(({ expanded, ...rest }) => ({
+        ...rest,
+        contacts: rest.contacts || [],
+        customFields: rest.customFields || {},
+      }));
+      set(ref(db, "trackerData"), {
+        accounts: cleanAccounts,
+        customColumns: newCustomColumns || customColumns,
+        contactIdCounter,
+        actionIdCounter,
+        lastUpdated: new Date().toISOString(),
+      }).then(() => {
+        setSyncStatus("synced");
+      }).catch((err) => {
+        console.error("Firebase write error:", err);
+        setSyncStatus("error");
+        isLocalUpdate.current = false;
+      });
+    }, 500);
+  };
+
+  // Wrapped setters that also trigger Firebase save
+  const setAccountsAndSync = (updater) => {
+    setAccounts(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      saveToFirebase(next, undefined);
+      return next;
+    });
+  };
+  const setCustomColumnsAndSync = (updater) => {
+    setCustomColumns(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      saveToFirebase(undefined, next);
+      return next;
+    });
+  };
+
+  // --- Account helpers (all use synced setters) ---
+  const updateAccount = (id, updater) => setAccountsAndSync(prev => prev.map(a => a.id === id ? updater(a) : a));
   const toggleAccountField = (id, field) => updateAccount(id, a => ({ ...a, [field]: !a[field] }));
-  const toggleExpand = (id) => updateAccount(id, a => ({ ...a, expanded: !a.expanded }));
-  const setExpandedSection = (id, section) => updateAccount(id, a => ({ ...a, expandedSection: section }));
+  const toggleExpand = (id) => setAccounts(prev => prev.map(a => a.id === id ? { ...a, expanded: !a.expanded } : a)); // local only
+  const setExpandedSection = (id, section) => setAccounts(prev => prev.map(a => a.id === id ? { ...a, expandedSection: section } : a)); // local only
   const startEdit = (acc) => { setEditingAccount(acc.id); setEditName(acc.name); };
   const saveEdit = (id) => { updateAccount(id, a => ({ ...a, name: editName })); setEditingAccount(null); };
 
@@ -145,63 +203,52 @@ export default function TigerTeamProgram() {
       ...a, phases: a.phases.map(p => p.id === phaseId ? { ...p, status: order[(order.indexOf(p.status) + 1) % order.length] } : p)
     }));
   };
-  const updatePhaseNotes = (accId, phaseId, notes) => {
-    updateAccount(accId, a => ({ ...a, phases: a.phases.map(p => p.id === phaseId ? { ...p, notes } : p) }));
-  };
+  const updatePhaseNotes = (accId, phaseId, notes) => updateAccount(accId, a => ({ ...a, phases: a.phases.map(p => p.id === phaseId ? { ...p, notes } : p) }));
 
-  const toggleAccountAction = (accId, actionId) => {
-    updateAccount(accId, a => ({ ...a, actions: a.actions.map(x => x.id === actionId ? { ...x, done: !x.done } : x) }));
-  };
-  const updateActionNotes = (accId, actionId, notes) => {
-    updateAccount(accId, a => ({ ...a, actions: a.actions.map(x => x.id === actionId ? { ...x, notes } : x) }));
-  };
-  const addAccountAction = (accId) => {
-    actionIdCounter++;
-    updateAccount(accId, a => ({ ...a, actions: [...a.actions, { id: actionIdCounter, action: "", owner: "", due: "", done: false, notes: "" }] }));
-  };
-  const removeAccountAction = (accId, actionId) => {
-    updateAccount(accId, a => ({ ...a, actions: a.actions.filter(x => x.id !== actionId) }));
-  };
-  const updateActionField = (accId, actionId, field, value) => {
-    updateAccount(accId, a => ({ ...a, actions: a.actions.map(x => x.id === actionId ? { ...x, [field]: value } : x) }));
-  };
+  const toggleAccountAction = (accId, actionId) => updateAccount(accId, a => ({ ...a, actions: a.actions.map(x => x.id === actionId ? { ...x, done: !x.done } : x) }));
+  const updateActionNotes = (accId, actionId, notes) => updateAccount(accId, a => ({ ...a, actions: a.actions.map(x => x.id === actionId ? { ...x, notes } : x) }));
+  const addAccountAction = (accId) => { actionIdCounter++; updateAccount(accId, a => ({ ...a, actions: [...a.actions, { id: actionIdCounter, action: "", owner: "", due: "", done: false, notes: "" }] })); };
+  const removeAccountAction = (accId, actionId) => updateAccount(accId, a => ({ ...a, actions: a.actions.filter(x => x.id !== actionId) }));
+  const updateActionField = (accId, actionId, field, value) => updateAccount(accId, a => ({ ...a, actions: a.actions.map(x => x.id === actionId ? { ...x, [field]: value } : x) }));
 
   const updateAccountNotes = (accId, notes) => updateAccount(accId, a => ({ ...a, accountNotes: notes }));
 
   const addContact = (accId) => { contactIdCounter++; updateAccount(accId, a => ({ ...a, contacts: [...a.contacts, { id: contactIdCounter, name: "", role: "", department: "", email: "", notes: "" }] })); };
-  const updateContact = (accId, cId, field, value) => { updateAccount(accId, a => ({ ...a, contacts: a.contacts.map(c => c.id === cId ? { ...c, [field]: value } : c) })); };
-  const removeContact = (accId, cId) => { updateAccount(accId, a => ({ ...a, contacts: a.contacts.filter(c => c.id !== cId) })); };
+  const updateContact = (accId, cId, field, value) => updateAccount(accId, a => ({ ...a, contacts: a.contacts.map(c => c.id === cId ? { ...c, [field]: value } : c) }));
+  const removeContact = (accId, cId) => updateAccount(accId, a => ({ ...a, contacts: a.contacts.filter(c => c.id !== cId) }));
 
   const addCustomColumn = () => {
     if (!newFieldName.trim()) return;
     const key = newFieldName.trim().toLowerCase().replace(/\s+/g, "_");
     if (customColumns.find(c => c.key === key)) return;
-    setCustomColumns(prev => [...prev, { key, label: newFieldName.trim(), type: newFieldType }]);
-    setAccounts(prev => prev.map(a => ({ ...a, customFields: { ...a.customFields, [key]: newFieldType === "checkbox" ? false : "" } })));
+    const newCols = [...customColumns, { key, label: newFieldName.trim(), type: newFieldType }];
+    setCustomColumnsAndSync(newCols);
+    setAccountsAndSync(prev => prev.map(a => ({ ...a, customFields: { ...a.customFields, [key]: newFieldType === "checkbox" ? false : "" } })));
     setNewFieldName(""); setNewFieldType("text"); setShowAddField(false);
   };
   const removeCustomColumn = (key) => {
-    setCustomColumns(prev => prev.filter(c => c.key !== key));
-    setAccounts(prev => prev.map(a => { const cf = { ...a.customFields }; delete cf[key]; return { ...a, customFields: cf }; }));
+    setCustomColumnsAndSync(prev => prev.filter(c => c.key !== key));
+    setAccountsAndSync(prev => prev.map(a => { const cf = { ...a.customFields }; delete cf[key]; return { ...a, customFields: cf }; }));
   };
   const updateCustomField = (accId, key, value) => updateAccount(accId, a => ({ ...a, customFields: { ...a.customFields, [key]: value } }));
 
   const resetData = () => {
-    if (window.confirm("Are you sure you want to reset all data? This cannot be undone.")) {
-      localStorage.removeItem(STORAGE_KEY);
+    if (window.confirm("Are you sure you want to reset ALL data for ALL users? This cannot be undone.")) {
       contactIdCounter = 100;
       actionIdCounter = 200;
-      setAccounts(makeAccounts());
-      setCustomColumns([]);
+      const fresh = makeAccounts();
+      setAccountsAndSync(fresh);
+      setCustomColumnsAndSync([]);
     }
   };
 
-  const totalContacts = accounts.reduce((sum, a) => sum + a.contacts.length, 0);
-  const accountProgress = accounts.map(a => {
-    const pc = a.phases.filter(p => p.status === "complete").length;
-    const ac = a.actions.filter(x => x.done).length;
-    return { ...a, phasesComplete: pc, actionsComplete: ac };
-  });
+  // --- Stats ---
+  const totalContacts = accounts.reduce((sum, a) => sum + (a.contacts?.length || 0), 0);
+  const accountProgress = accounts.map(a => ({
+    ...a,
+    phasesComplete: a.phases.filter(p => p.status === "complete").length,
+    actionsComplete: a.actions.filter(x => x.done).length,
+  }));
   const totalPhasesComplete = accountProgress.reduce((sum, a) => sum + a.phasesComplete, 0);
   const totalPhases = accounts.length * 6;
   const totalActionsComplete = accountProgress.reduce((sum, a) => sum + a.actionsComplete, 0);
@@ -211,13 +258,27 @@ export default function TigerTeamProgram() {
     { id: "overview", label: "Program Overview" },
     { id: "accounts", label: "Account Tracker" },
   ];
-
   const sectionTabs = [
     { id: "contacts", label: "👤 Contacts" },
     { id: "phases", label: "📅 Phases" },
     { id: "actions", label: "✅ Actions" },
     { id: "notes", label: "📝 Notes" },
   ];
+
+  const syncDot = syncStatus === "synced" ? T.green : syncStatus === "saving" ? T.amber : syncStatus === "error" ? T.red : T.textMuted;
+  const syncLabel = syncStatus === "synced" ? "All changes synced" : syncStatus === "saving" ? "Saving…" : syncStatus === "error" ? "Sync error — retrying" : "Connecting…";
+
+  if (loading) {
+    return (
+      <div style={{ fontFamily: "'DM Sans', sans-serif", background: T.pageBg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 40, marginBottom: 16 }}>⚡</div>
+          <div style={{ fontSize: 14, color: T.textSecondary }}>Loading Tiger Team Tracker…</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ fontFamily: "'DM Sans', 'Segoe UI', sans-serif", background: T.pageBg, color: T.textPrimary, minHeight: "100vh", padding: 0 }}>
@@ -232,12 +293,10 @@ export default function TigerTeamProgram() {
             <h1 style={{ fontSize: 26, fontWeight: 700, margin: 0, letterSpacing: -0.5, color: T.textPrimary }}>Joule + WalkMe Use Case Initiative</h1>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
-            {lastSaved && (
-              <span style={{ fontSize: 11, color: T.green, fontFamily: "'Space Mono', monospace", display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ width: 6, height: 6, borderRadius: "50%", background: T.green, display: "inline-block" }} />
-                Auto-saved {lastSaved.toLocaleTimeString()}
-              </span>
-            )}
+            <span style={{ fontSize: 11, color: syncDot, fontFamily: "'Space Mono', monospace", display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: syncDot, display: "inline-block", animation: syncStatus === "saving" ? "pulse 1s infinite" : "none" }} />
+              {syncLabel}
+            </span>
             <button onClick={resetData} style={{ ...btnSmall, fontSize: 10, padding: "4px 10px", color: T.red, border: `1px solid ${T.red}30` }}>Reset All</button>
           </div>
         </div>
@@ -247,7 +306,7 @@ export default function TigerTeamProgram() {
         <div style={{ display: "flex", gap: 20, marginTop: 24, marginLeft: 56, flexWrap: "wrap" }}>
           {[
             { label: "Target Accounts", value: "10", sub: "5 US · 5 EU" },
-            { label: "Contacts Mapped", value: String(totalContacts), sub: `across ${accounts.filter(a => a.contacts.length > 0).length} accounts` },
+            { label: "Contacts Mapped", value: String(totalContacts), sub: `across ${accounts.filter(a => (a.contacts?.length || 0) > 0).length} accounts` },
             { label: "Phases Complete", value: `${totalPhasesComplete}/${totalPhases}`, sub: `${Math.round(totalPhasesComplete / totalPhases * 100)}% across all accounts` },
             { label: "Actions Done", value: `${totalActionsComplete}/${totalActions}`, sub: `${totalActions - totalActionsComplete} remaining` },
           ].map((stat, i) => (
@@ -260,7 +319,7 @@ export default function TigerTeamProgram() {
         </div>
       </div>
 
-      {/* Tab nav */}
+      {/* Tabs */}
       <div style={{ display: "flex", gap: 2, padding: "0 40px", background: T.surfaceBg, borderBottom: `1px solid ${T.surfaceBorder}` }}>
         {tabs.map(tab => (
           <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{
@@ -308,7 +367,7 @@ export default function TigerTeamProgram() {
           </div>
         )}
 
-        {/* ACCOUNTS TAB */}
+        {/* ACCOUNTS */}
         {activeTab === "accounts" && (
           <div>
             <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 16, gap: 8 }}>
@@ -349,7 +408,6 @@ export default function TigerTeamProgram() {
                     const ap = accountProgress.find(x => x.id === acc.id);
                     return (
                       <div key={acc.id} style={{ background: T.cardBg, borderRadius: 12, border: acc.expanded ? `1px solid ${T.accentBorder}` : `1px solid ${T.cardBorder}`, overflow: "hidden", marginBottom: 8, boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
-                        {/* Account row */}
                         <div style={{ display: "flex", alignItems: "center", padding: "12px 16px", gap: 12, cursor: "pointer" }} onClick={() => toggleExpand(acc.id)}>
                           <span style={{ fontSize: 12, color: T.textMuted, transition: "transform .2s", display: "inline-block", transform: acc.expanded ? "rotate(90deg)" : "rotate(0deg)", userSelect: "none", flexShrink: 0 }}>▶</span>
                           <div style={{ flex: 1, minWidth: 0 }}>
@@ -365,7 +423,7 @@ export default function TigerTeamProgram() {
                           <StatusPill status="Joule" color={T.green} />
                           <StatusPill status="WalkMe" color={T.green} />
                           <div style={{ display: "flex", gap: 6, fontSize: 11, color: T.textMuted, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>
-                            <span style={{ color: T.purple }}>{acc.contacts.length}p</span>
+                            <span style={{ color: T.purple }}>{(acc.contacts?.length || 0)}p</span>
                             <span>·</span>
                             <span style={{ color: ap?.phasesComplete === 6 ? T.green : T.amber }}>{ap?.phasesComplete}/6</span>
                             <span>·</span>
@@ -379,15 +437,14 @@ export default function TigerTeamProgram() {
                           {customColumns.map(col => (
                             <div key={col.key} onClick={e => e.stopPropagation()} style={{ flexShrink: 0 }}>
                               {col.type === "checkbox" ? (
-                                <Checkbox checked={!!acc.customFields[col.key]} onChange={() => updateCustomField(acc.id, col.key, !acc.customFields[col.key])} />
+                                <Checkbox checked={!!acc.customFields?.[col.key]} onChange={() => updateCustomField(acc.id, col.key, !acc.customFields?.[col.key])} />
                               ) : (
-                                <input value={acc.customFields[col.key] || ""} onChange={e => updateCustomField(acc.id, col.key, e.target.value)} style={{ ...inputStyle, width: 90 }} placeholder="—" />
+                                <input value={acc.customFields?.[col.key] || ""} onChange={e => updateCustomField(acc.id, col.key, e.target.value)} style={{ ...inputStyle, width: 90 }} placeholder="—" />
                               )}
                             </div>
                           ))}
                         </div>
 
-                        {/* Expanded panel */}
                         {acc.expanded && (
                           <div style={{ borderTop: `1px solid ${T.surfaceBorder}` }}>
                             <div style={{ display: "flex", gap: 0, padding: "0 16px", background: T.sectionTabBg, borderBottom: `1px solid ${T.surfaceBorder}` }}>
@@ -400,116 +457,11 @@ export default function TigerTeamProgram() {
                                 }}>{st.label}</button>
                               ))}
                             </div>
-
                             <div style={{ padding: "16px 20px 20px 20px", background: T.expandedBg }}>
-
-                              {/* CONTACTS */}
-                              {acc.expandedSection === "contacts" && (
-                                <div>
-                                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                                    <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace" }}>Contacts & Personas</span>
-                                    <button onClick={() => addContact(acc.id)} style={{ ...btnSmall, background: T.accentBg, color: T.accent, border: `1px solid ${T.accentBorder}` }}>+ Add Contact</button>
-                                  </div>
-                                  {acc.contacts.length === 0 ? (
-                                    <div style={{ fontSize: 12, color: T.textMuted, padding: "8px 0", fontStyle: "italic" }}>No contacts yet — click "+ Add Contact" to map personas.</div>
-                                  ) : (
-                                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                                      <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1.2fr 1.3fr 28px", gap: 8, paddingBottom: 4 }}>
-                                        {["Name", "Role / Title", "Department", "Email", "Notes", ""].map(h => (
-                                          <span key={h} style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: 1.2, fontFamily: "'Space Mono', monospace", fontWeight: 600 }}>{h}</span>
-                                        ))}
-                                      </div>
-                                      {acc.contacts.map(contact => (
-                                        <div key={contact.id} style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1.2fr 1.3fr 28px", gap: 8, alignItems: "center" }}>
-                                          <input value={contact.name} onChange={e => updateContact(acc.id, contact.id, "name", e.target.value)} placeholder="Full name" style={inputStyle} />
-                                          <select value={contact.role} onChange={e => updateContact(acc.id, contact.id, "role", e.target.value)} style={selectStyle}>
-                                            <option value="">Select role…</option>
-                                            {ROLE_OPTIONS.map(r => <option key={r} value={r}>{r}</option>)}
-                                          </select>
-                                          <select value={contact.department} onChange={e => updateContact(acc.id, contact.id, "department", e.target.value)} style={selectStyle}>
-                                            <option value="">Select dept…</option>
-                                            {DEPT_OPTIONS.map(d => <option key={d} value={d}>{d}</option>)}
-                                          </select>
-                                          <input value={contact.email} onChange={e => updateContact(acc.id, contact.id, "email", e.target.value)} placeholder="email@company.com" style={inputStyle} />
-                                          <input value={contact.notes} onChange={e => updateContact(acc.id, contact.id, "notes", e.target.value)} placeholder="e.g. champion, blocker…" style={inputStyle} />
-                                          <span onClick={() => removeContact(acc.id, contact.id)} style={{ cursor: "pointer", color: T.red, fontSize: 16, textAlign: "center", opacity: 0.5 }} title="Remove">×</span>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                              {/* PHASES */}
-                              {acc.expandedSection === "phases" && (
-                                <div>
-                                  <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace", marginBottom: 12 }}>Account Phase Timeline</div>
-                                  <p style={{ fontSize: 11, color: T.textMuted, marginBottom: 12 }}>Click a phase to cycle status. Add notes per phase for account-specific context.</p>
-                                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                                    {acc.phases.map((phase, i) => {
-                                      const sc = statusColor(phase.status);
-                                      return (
-                                        <div key={phase.id} style={{ background: T.cardBg, borderRadius: 10, border: `1px solid ${T.cardBorder}`, overflow: "hidden" }}>
-                                          <div onClick={() => cycleAccountPhase(acc.id, phase.id)} style={{ display: "flex", alignItems: "center", gap: 14, padding: "12px 16px", cursor: "pointer" }}>
-                                            <div style={{ width: 30, height: 30, borderRadius: 8, background: sc.bg, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Space Mono', monospace", fontWeight: 700, fontSize: 13, color: sc.text, border: `1px solid ${sc.dot}40`, flexShrink: 0 }}>{i + 1}</div>
-                                            <div style={{ flex: 1 }}>
-                                              <div style={{ fontWeight: 600, fontSize: 13, color: T.textPrimary }}>{phase.name}</div>
-                                              <div style={{ fontSize: 11, color: T.textMuted }}>{phase.description}</div>
-                                            </div>
-                                            <div style={{ fontSize: 11, color: T.textMuted, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>{phase.target}</div>
-                                            <div style={{ padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 600, background: sc.bg, color: sc.text, border: `1px solid ${sc.dot}40`, textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>{phase.status}</div>
-                                          </div>
-                                          <div style={{ padding: "0 16px 12px 60px" }}>
-                                            <textarea value={phase.notes} onChange={e => updatePhaseNotes(acc.id, phase.id, e.target.value)} placeholder="Phase notes for this account…" style={{ ...textareaStyle, minHeight: 36, fontSize: 11 }} />
-                                          </div>
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              )}
-
-                              {/* ACTIONS */}
-                              {acc.expandedSection === "actions" && (
-                                <div>
-                                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                                    <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace" }}>Account Action Items</span>
-                                    <button onClick={() => addAccountAction(acc.id)} style={{ ...btnSmall, background: T.accentBg, color: T.accent, border: `1px solid ${T.accentBorder}` }}>+ Add Action</button>
-                                  </div>
-                                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
-                                    <span style={{ fontSize: 11, color: T.amber, fontFamily: "'Space Mono', monospace", fontWeight: 600 }}>{acc.actions.filter(x => x.done).length}/{acc.actions.length}</span>
-                                    <div style={{ flex: 1, height: 4, background: T.surfaceBorder, borderRadius: 2, overflow: "hidden" }}>
-                                      <div style={{ height: "100%", width: acc.actions.length ? `${(acc.actions.filter(x => x.done).length / acc.actions.length) * 100}%` : "0%", background: `linear-gradient(90deg, ${T.accent}, ${T.accentLight})`, borderRadius: 2, transition: "width .3s" }} />
-                                    </div>
-                                  </div>
-                                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                                    {acc.actions.map(act => (
-                                      <div key={act.id} style={{ background: T.cardBg, borderRadius: 10, border: act.done ? `1px solid ${T.greenBorder}` : `1px solid ${T.cardBorder}`, opacity: act.done ? 0.6 : 1, overflow: "hidden" }}>
-                                        <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px" }}>
-                                          <Checkbox checked={act.done} onChange={() => toggleAccountAction(acc.id, act.id)} />
-                                          <div style={{ flex: 1, minWidth: 0 }}>
-                                            <input value={act.action} onChange={e => updateActionField(acc.id, act.id, "action", e.target.value)} placeholder="Action item…" style={{ ...inputStyle, fontWeight: 600, background: "transparent", border: "none", padding: "2px 0", textDecoration: act.done ? "line-through" : "none" }} />
-                                          </div>
-                                          <input value={act.owner} onChange={e => updateActionField(acc.id, act.id, "owner", e.target.value)} placeholder="Owner" style={{ ...inputStyle, width: 110, fontSize: 11 }} />
-                                          <input value={act.due} onChange={e => updateActionField(acc.id, act.id, "due", e.target.value)} placeholder="Due" style={{ ...inputStyle, width: 80, fontSize: 11, fontFamily: "'Space Mono', monospace" }} />
-                                          <span onClick={() => removeAccountAction(acc.id, act.id)} style={{ cursor: "pointer", color: T.red, fontSize: 14, opacity: 0.5 }} title="Remove">×</span>
-                                        </div>
-                                        <div style={{ padding: "0 14px 10px 46px" }}>
-                                          <textarea value={act.notes} onChange={e => updateActionNotes(acc.id, act.id, e.target.value)} placeholder="Notes / description…" style={{ ...textareaStyle, minHeight: 30, fontSize: 11 }} />
-                                        </div>
-                                      </div>
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
-
-                              {/* NOTES */}
-                              {acc.expandedSection === "notes" && (
-                                <div>
-                                  <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace", marginBottom: 12 }}>Account Notes & Description</div>
-                                  <textarea value={acc.accountNotes} onChange={e => updateAccountNotes(acc.id, e.target.value)} placeholder={"General notes about this account…\n\nUse this space for:\n• Account strategy & objectives\n• Key decisions & outcomes\n• Risks & blockers\n• Meeting summaries\n• Any other account-level context"} style={{ ...textareaStyle, minHeight: 180, fontSize: 13, lineHeight: 1.7 }} />
-                                </div>
-                              )}
+                              {acc.expandedSection === "contacts" && (<ContactsSection acc={acc} addContact={addContact} updateContact={updateContact} removeContact={removeContact} />)}
+                              {acc.expandedSection === "phases" && (<PhasesSection acc={acc} cycleAccountPhase={cycleAccountPhase} updatePhaseNotes={updatePhaseNotes} />)}
+                              {acc.expandedSection === "actions" && (<ActionsSection acc={acc} toggleAccountAction={toggleAccountAction} updateActionNotes={updateActionNotes} addAccountAction={addAccountAction} removeAccountAction={removeAccountAction} updateActionField={updateActionField} />)}
+                              {acc.expandedSection === "notes" && (<NotesSection acc={acc} updateAccountNotes={updateAccountNotes} />)}
                             </div>
                           </div>
                         )}
@@ -521,12 +473,127 @@ export default function TigerTeamProgram() {
             ))}
           </div>
         )}
+      </div>
+      <style>{`@keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.4 } }`}</style>
+    </div>
+  );
+}
 
+// --- Sub-components for expanded sections ---
+function ContactsSection({ acc, addContact, updateContact, removeContact }) {
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace" }}>Contacts & Personas</span>
+        <button onClick={() => addContact(acc.id)} style={{ ...btnSmall, background: T.accentBg, color: T.accent, border: `1px solid ${T.accentBorder}` }}>+ Add Contact</button>
+      </div>
+      {(!acc.contacts || acc.contacts.length === 0) ? (
+        <div style={{ fontSize: 12, color: T.textMuted, padding: "8px 0", fontStyle: "italic" }}>No contacts yet — click "+ Add Contact" to map personas.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1.2fr 1.3fr 28px", gap: 8, paddingBottom: 4 }}>
+            {["Name", "Role / Title", "Department", "Email", "Notes", ""].map(h => (
+              <span key={h} style={{ fontSize: 10, color: T.textMuted, textTransform: "uppercase", letterSpacing: 1.2, fontFamily: "'Space Mono', monospace", fontWeight: 600 }}>{h}</span>
+            ))}
+          </div>
+          {acc.contacts.map(contact => (
+            <div key={contact.id} style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1.2fr 1.3fr 28px", gap: 8, alignItems: "center" }}>
+              <input value={contact.name} onChange={e => updateContact(acc.id, contact.id, "name", e.target.value)} placeholder="Full name" style={inputStyle} />
+              <select value={contact.role} onChange={e => updateContact(acc.id, contact.id, "role", e.target.value)} style={selectStyle}>
+                <option value="">Select role…</option>
+                {ROLE_OPTIONS.map(r => <option key={r} value={r}>{r}</option>)}
+              </select>
+              <select value={contact.department} onChange={e => updateContact(acc.id, contact.id, "department", e.target.value)} style={selectStyle}>
+                <option value="">Select dept…</option>
+                {DEPT_OPTIONS.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <input value={contact.email} onChange={e => updateContact(acc.id, contact.id, "email", e.target.value)} placeholder="email@company.com" style={inputStyle} />
+              <input value={contact.notes} onChange={e => updateContact(acc.id, contact.id, "notes", e.target.value)} placeholder="e.g. champion, blocker…" style={inputStyle} />
+              <span onClick={() => removeContact(acc.id, contact.id)} style={{ cursor: "pointer", color: T.red, fontSize: 16, textAlign: "center", opacity: 0.5 }} title="Remove">×</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PhasesSection({ acc, cycleAccountPhase, updatePhaseNotes }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace", marginBottom: 12 }}>Account Phase Timeline</div>
+      <p style={{ fontSize: 11, color: T.textMuted, marginBottom: 12 }}>Click a phase to cycle status. Add notes per phase for account-specific context.</p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {acc.phases.map((phase, i) => {
+          const sc = statusColor(phase.status);
+          return (
+            <div key={phase.id} style={{ background: T.cardBg, borderRadius: 10, border: `1px solid ${T.cardBorder}`, overflow: "hidden" }}>
+              <div onClick={() => cycleAccountPhase(acc.id, phase.id)} style={{ display: "flex", alignItems: "center", gap: 14, padding: "12px 16px", cursor: "pointer" }}>
+                <div style={{ width: 30, height: 30, borderRadius: 8, background: sc.bg, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Space Mono', monospace", fontWeight: 700, fontSize: 13, color: sc.text, border: `1px solid ${sc.dot}40`, flexShrink: 0 }}>{i + 1}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: 13, color: T.textPrimary }}>{phase.name}</div>
+                  <div style={{ fontSize: 11, color: T.textMuted }}>{phase.description}</div>
+                </div>
+                <div style={{ fontSize: 11, color: T.textMuted, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>{phase.target}</div>
+                <div style={{ padding: "3px 10px", borderRadius: 16, fontSize: 10, fontWeight: 600, background: sc.bg, color: sc.text, border: `1px solid ${sc.dot}40`, textTransform: "uppercase", letterSpacing: 1, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>{phase.status}</div>
+              </div>
+              <div style={{ padding: "0 16px 12px 60px" }}>
+                <textarea value={phase.notes} onChange={e => updatePhaseNotes(acc.id, phase.id, e.target.value)} placeholder="Phase notes for this account…" style={{ ...textareaStyle, minHeight: 36, fontSize: 11 }} />
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
 }
 
+function ActionsSection({ acc, toggleAccountAction, updateActionNotes, addAccountAction, removeAccountAction, updateActionField }) {
+  const doneCount = acc.actions.filter(x => x.done).length;
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace" }}>Account Action Items</span>
+        <button onClick={() => addAccountAction(acc.id)} style={{ ...btnSmall, background: T.accentBg, color: T.accent, border: `1px solid ${T.accentBorder}` }}>+ Add Action</button>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+        <span style={{ fontSize: 11, color: T.amber, fontFamily: "'Space Mono', monospace", fontWeight: 600 }}>{doneCount}/{acc.actions.length}</span>
+        <div style={{ flex: 1, height: 4, background: T.surfaceBorder, borderRadius: 2, overflow: "hidden" }}>
+          <div style={{ height: "100%", width: acc.actions.length ? `${(doneCount / acc.actions.length) * 100}%` : "0%", background: `linear-gradient(90deg, ${T.accent}, ${T.accentLight})`, borderRadius: 2, transition: "width .3s" }} />
+        </div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {acc.actions.map(act => (
+          <div key={act.id} style={{ background: T.cardBg, borderRadius: 10, border: act.done ? `1px solid ${T.greenBorder}` : `1px solid ${T.cardBorder}`, opacity: act.done ? 0.6 : 1, overflow: "hidden" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px" }}>
+              <Checkbox checked={act.done} onChange={() => toggleAccountAction(acc.id, act.id)} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <input value={act.action} onChange={e => updateActionField(acc.id, act.id, "action", e.target.value)} placeholder="Action item…" style={{ ...inputStyle, fontWeight: 600, background: "transparent", border: "none", padding: "2px 0", textDecoration: act.done ? "line-through" : "none" }} />
+              </div>
+              <input value={act.owner} onChange={e => updateActionField(acc.id, act.id, "owner", e.target.value)} placeholder="Owner" style={{ ...inputStyle, width: 110, fontSize: 11 }} />
+              <input value={act.due} onChange={e => updateActionField(acc.id, act.id, "due", e.target.value)} placeholder="Due" style={{ ...inputStyle, width: 80, fontSize: 11, fontFamily: "'Space Mono', monospace" }} />
+              <span onClick={() => removeAccountAction(acc.id, act.id)} style={{ cursor: "pointer", color: T.red, fontSize: 14, opacity: 0.5 }} title="Remove">×</span>
+            </div>
+            <div style={{ padding: "0 14px 10px 46px" }}>
+              <textarea value={act.notes} onChange={e => updateActionNotes(acc.id, act.id, e.target.value)} placeholder="Notes / description…" style={{ ...textareaStyle, minHeight: 30, fontSize: 11 }} />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function NotesSection({ acc, updateAccountNotes }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 2, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace", marginBottom: 12 }}>Account Notes & Description</div>
+      <textarea value={acc.accountNotes} onChange={e => updateAccountNotes(acc.id, e.target.value)} placeholder={"General notes about this account…\n\nUse this space for:\n• Account strategy & objectives\n• Key decisions & outcomes\n• Risks & blockers\n• Meeting summaries\n• Any other account-level context"} style={{ ...textareaStyle, minHeight: 180, fontSize: 13, lineHeight: 1.7 }} />
+    </div>
+  );
+}
+
+// --- Shared UI components ---
 function Card({ title, children, span }) {
   return (
     <div style={{ background: T.cardBg, borderRadius: 12, border: `1px solid ${T.cardBorder}`, padding: "24px", gridColumn: span ? `span ${span}` : undefined, boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
