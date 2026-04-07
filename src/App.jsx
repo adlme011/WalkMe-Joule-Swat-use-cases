@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 
 const DEPT_OPTIONS = ["IT", "Digital Transformation", "HR", "Finance", "Operations", "Procurement", "C-Suite", "Product", "Engineering", "Sales", "Customer Success", "Other"];
 const ROLE_OPTIONS = ["VP", "Director", "Manager", "Architect", "Admin", "Analyst", "Executive Sponsor", "End User Champion", "Other"];
@@ -89,15 +89,48 @@ const textareaStyle = { ...inputStyle, minHeight: 60, resize: "vertical", lineHe
 let contactIdCounter = 100;
 let actionIdCounter = 200;
 
+const STORAGE_KEY = "tiger-team-data";
+
+const loadSaved = () => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (data.contactIdCounter) contactIdCounter = data.contactIdCounter;
+    if (data.actionIdCounter) actionIdCounter = data.actionIdCounter;
+    return data;
+  } catch { return null; }
+};
+
 export default function TigerTeamProgram() {
+  const [accounts, setAccounts] = useState(() => {
+    const saved = loadSaved();
+    return saved?.accounts || makeAccounts();
+  });
+  const [customColumns, setCustomColumns] = useState(() => {
+    const saved = loadSaved();
+    return saved?.customColumns || [];
+  });
   const [activeTab, setActiveTab] = useState("overview");
-  const [accounts, setAccounts] = useState(makeAccounts);
   const [editingAccount, setEditingAccount] = useState(null);
   const [editName, setEditName] = useState("");
-  const [customColumns, setCustomColumns] = useState([]);
   const [showAddField, setShowAddField] = useState(false);
   const [newFieldName, setNewFieldName] = useState("");
   const [newFieldType, setNewFieldType] = useState("text");
+  const [lastSaved, setLastSaved] = useState(null);
+
+  // Auto-save to localStorage on every data change
+  useEffect(() => {
+    const data = {
+      accounts,
+      customColumns,
+      contactIdCounter,
+      actionIdCounter,
+      savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    setLastSaved(new Date());
+  }, [accounts, customColumns]);
 
   const updateAccount = (id, updater) => setAccounts(prev => prev.map(a => a.id === id ? updater(a) : a));
   const toggleAccountField = (id, field) => updateAccount(id, a => ({ ...a, [field]: !a[field] }));
@@ -153,6 +186,16 @@ export default function TigerTeamProgram() {
   };
   const updateCustomField = (accId, key, value) => updateAccount(accId, a => ({ ...a, customFields: { ...a.customFields, [key]: value } }));
 
+  const resetData = () => {
+    if (window.confirm("Are you sure you want to reset all data? This cannot be undone.")) {
+      localStorage.removeItem(STORAGE_KEY);
+      contactIdCounter = 100;
+      actionIdCounter = 200;
+      setAccounts(makeAccounts());
+      setCustomColumns([]);
+    }
+  };
+
   const totalContacts = accounts.reduce((sum, a) => sum + a.contacts.length, 0);
   const accountProgress = accounts.map(a => {
     const pc = a.phases.filter(p => p.status === "complete").length;
@@ -184,9 +227,18 @@ export default function TigerTeamProgram() {
       <div style={{ background: T.headerBg, borderBottom: `1px solid ${T.cardBorder}`, padding: "32px 40px 24px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 8 }}>
           <div style={{ width: 42, height: 42, borderRadius: 10, background: "linear-gradient(135deg, #7C5C3C, #A07850)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 700, color: "#FFF", fontFamily: "'Space Mono', monospace" }}>⚡</div>
-          <div>
+          <div style={{ flex: 1 }}>
             <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: 3, textTransform: "uppercase", color: T.accent, fontFamily: "'Space Mono', monospace" }}>AI SWAT / Tiger Team</div>
             <h1 style={{ fontSize: 26, fontWeight: 700, margin: 0, letterSpacing: -0.5, color: T.textPrimary }}>Joule + WalkMe Use Case Initiative</h1>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
+            {lastSaved && (
+              <span style={{ fontSize: 11, color: T.green, fontFamily: "'Space Mono', monospace", display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ width: 6, height: 6, borderRadius: "50%", background: T.green, display: "inline-block" }} />
+                Auto-saved {lastSaved.toLocaleTimeString()}
+              </span>
+            )}
+            <button onClick={resetData} style={{ ...btnSmall, fontSize: 10, padding: "4px 10px", color: T.red, border: `1px solid ${T.red}30` }}>Reset All</button>
           </div>
         </div>
         <p style={{ fontSize: 14, color: T.textSecondary, margin: "12px 0 0 56px", maxWidth: 700, lineHeight: 1.6 }}>
